@@ -180,10 +180,47 @@ function Get-LargeFile {
 function Get-WindowsIso {
     Write-Step "Requesting ISO download URL from Fido ($WinRelease $Edition $Arch)..."
 
-    # Fido -GetUrl prints the official Microsoft download URL to stdout
-    $url = & $FidoPath -Win 11 -Rel $WinRelease -Ed $Edition -Lang $Language -Arch $Arch -GetUrl
-    if (-not $url) { throw "Fido did not return a download URL." }
-    $url = ($url | Select-Object -Last 1).Trim()
+    # Fido runs in a SEPARATE PowerShell process. Two reasons, both real:
+    #
+    # 1. StrictMode. This script sets `Set-StrictMode -Version Latest`, and
+    #    strict mode is INHERITED by child scopes. Fido is not strict-mode-safe:
+    #    on the happy path it evaluates `if ($r.Errors)` against a response
+    #    object that legitimately HAS no Errors property. Normally that yields
+    #    $null; under strict mode it is a terminating error --
+    #      "The property 'Errors' cannot be found on this object"
+    #    -- so Fido would blow up precisely BECAUSE Microsoft answered correctly.
+    #
+    # 2. Fido calls `exit` on several paths. A separate process keeps that from
+    #    tearing down this script.
+    $fidoArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $FidoPath,
+        '-Win',  '11',
+        '-Rel',  $WinRelease,
+        '-Ed',   $Edition,
+        '-Lang', $Language,
+        '-Arch', $Arch,
+        '-GetUrl'
+    )
+
+    $output = & powershell.exe @fidoArgs 2>&1
+    $fidoExit = $LASTEXITCODE
+
+    # Fido prints chatter alongside the URL; take the last thing that IS a URL.
+    $url = $output |
+        ForEach-Object { $_.ToString().Trim() } |
+        Where-Object   { $_ -match '^https?://' } |
+        Select-Object  -Last 1
+
+    if (-not $url) {
+        Write-Warning "Fido exit code: $fidoExit"
+        Write-Warning "Fido output:"
+        $output | ForEach-Object { Write-Warning "  $_" }
+        # If the dump above mentions a ban / message code 715-123130, Microsoft
+        # has blocked this runner's IP -- see README, 'When Fido gets blocked'.
+        throw "Fido did not return a download URL."
+    }
+
     Write-Host "ISO URL: $url"
 
     $isoPath = Join-Path $IsoDownloadDir "windows.iso"
