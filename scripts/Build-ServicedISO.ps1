@@ -77,6 +77,22 @@ function Get-LargeFile {
         [int]$BitsTimeoutMinutes = 20
     )
 
+    # ---------------------------------------------------------------------
+    # NOTE: every native command below ends in `2>&1 | Out-Host`. That is
+    # LOAD-BEARING, not cosmetic.
+    #
+    # A native exe's stdout goes to PowerShell's SUCCESS STREAM. Un-redirected,
+    # every line aria2c/curl prints becomes part of THIS FUNCTION'S OUTPUT. A
+    # caller doing `Get-LargeFile ...; return $path` then returns an ARRAY of
+    # [downloader chatter..., path]. Pass that to a [string] parameter and
+    # PowerShell silently joins it with spaces -> a garbage path, and downstream
+    # tools report a baffling "cannot find the file specified" for a file you
+    # can plainly see on disk.
+    #
+    # Out-Host writes to the console (still visible in CI logs) while emitting
+    # NOTHING to the pipeline. Do not "simplify" it away.
+    # ---------------------------------------------------------------------
+
     $sw = [Diagnostics.Stopwatch]::StartNew()
 
     function Report($tool) {
@@ -107,8 +123,8 @@ function Get-LargeFile {
             --file-allocation=falloc `
             --console-log-level=warn --summary-interval=30 `
             --allow-overwrite=true --auto-file-renaming=false `
-            -d $dir -o $file $Uri
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile)) { Report "aria2c"; return }
+            -d $dir -o $file $Uri 2>&1 | Out-Host
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $OutFile)) { Report "aria2c"; return }
         Write-Warning "aria2c exited $LASTEXITCODE. Falling back to curl.exe."
         Clear-Partial
     }
@@ -118,7 +134,7 @@ function Get-LargeFile {
     if (Test-Path $curl) {
         Write-Host "Downloading $Description via curl.exe..."
         & $curl -L --fail --retry 3 --retry-delay 5 --retry-all-errors `
-            -C - -o $OutFile $Uri
+            -C - -o $OutFile $Uri 2>&1 | Out-Host
         if ($LASTEXITCODE -eq 0) { Report "curl"; return }
         Write-Warning "curl.exe exited $LASTEXITCODE. Falling back to BITS."
         Clear-Partial
@@ -324,6 +340,15 @@ function Get-LatestCumulativeUpdate {
 function Expand-Iso {
     param([string]$IsoPath)
 
+    # Guard: if a caller ever leaks native-command output into a return value
+    # again, $IsoPath arrives as space-joined garbage. Catch it HERE, loudly,
+    # instead of letting 7-Zip or Mount-DiskImage report an inscrutable
+    # "cannot find the file specified" about a file that obviously exists.
+    if ([string]::IsNullOrWhiteSpace($IsoPath) -or
+        -not (Test-Path -LiteralPath $IsoPath -PathType Leaf)) {
+        throw "Expand-Iso got a bad ISO path. Received: '$IsoPath'"
+    }
+
     # Prefer 7-Zip over Mount-DiskImage.
     #
     # Mount-DiskImage is fragile on a CI runner: it depends on the Virtual Disk
@@ -346,7 +371,7 @@ function Expand-Iso {
     if ($7zPath) {
         Write-Step "Extracting ISO with 7-Zip -> $ExtractDir ..."
         # -y assume yes, -bso0/-bsp0 silence per-file and progress spam
-        & $7zPath x $IsoPath "-o$ExtractDir" -y -bso0 -bsp0
+        & $7zPath x $IsoPath "-o$ExtractDir" -y -bso0 -bsp0 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed (exit $LASTEXITCODE)." }
     }
     else {
