@@ -1,0 +1,226 @@
+name: Build Serviced Windows 11 ISO
+
+# =====================================================================
+# PUBLIC REPO + PRIVATE AZURE BLOB
+#
+# The repo is public so that Windows runner minutes are free and
+# unlimited. The ISO itself is NEVER published here -- it goes to a
+# PRIVATE Blob container. Only code + a pointer manifest are public.
+#
+# +-----------------------------------------------------------------+
+# | SECURITY -- DO NOT ADD `pull_request` OR `pull_request_target`.  |
+# |                                                                  |
+# | On a public repo anyone can open a PR. GitHub withholds secrets  |
+# | from fork PRs, but `pull_request_target` runs WITH secrets in    |
+# | the base-repo context -- a malicious PR that edits this file     |
+# | could then exfiltrate AZURE_STORAGE_KEY.                         |
+# |                                                                  |
+# | Triggers below are `schedule` + `workflow_dispatch` ONLY.        |
+# | workflow_dispatch requires write access. The key stays safe.     |
+# +-----------------------------------------------------------------+
+#
+# The Blob container MUST have public access level = Private
+# (no anonymous read). Otherwise you are publicly redistributing a
+# modified Windows ISO, which is exactly what we're avoiding.
+# =====================================================================
+
+on:
+  schedule:
+    # Weekly, Wednesday 06:00 UTC. Affordable now: public repos get
+    # unlimited free minutes on standard hosted runners.
+    - cron: "0 6 * * 3"
+  workflow_dispatch:
+    inputs:
+      win_release:
+        description: "Windows 11 release"
+        type: choice
+        default: "25H2"
+        options: [ "25H2", "24H2" ]
+      edition:
+        description: "Edition (Fido)"
+        default: "Pro"
+      image_edition:
+        description: "WIM ImageName to service"
+        default: "Windows 11 Pro"
+      build:
+        description: "OS build family for CU search (25H2=26200, 24H2=26100)"
+        default: "26200"
+
+# Least privilege: only enough to cut the pointer Release.
+permissions:
+  contents: write
+
+env:
+  KEEP_LAST: "3"        # ISOs to retain in the container
+
+jobs:
+  build-iso:
+    # MUST be windows-2022. windows-latest (Server 2025) dropped the D:
+    # drive and leaves only ~33 GB on C: -- not enough for
+    # ISO + extract + WIM. windows-2022 still has D: with ~140 GB free.
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show disk layout
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize
+
+      - name: "Prepare work dir on D:"
+        shell: pwsh
+        run: New-Item -Path "D:\work" -ItemType Directory -Force | Out-Null
+
+      - name: Fetch Fido
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/pbatard/Fido/raw/master/Fido.ps1" `
+            -OutFile "D:\work\Fido.ps1" -UseBasicParsing
+
+      - name: Install ADK Deployment Tools (oscdimg)
+        shell: pwsh
+        run: |
+          # NOTE: this fwlink changes with each ADK release. If this step
+          # fails, grab the current ADK link from Microsoft and swap it in.
+          $adk = "D:\work\adksetup.exe"
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2289980" `
+            -OutFile $adk -UseBasicParsing
+          Start-Process -FilePath $adk `
+            -ArgumentList "/quiet /features OptionId.DeploymentTools /norestart" -Wait
+          $oscdimg = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe"
+          if (-not (Test-Path $oscdimg)) { throw "oscdimg not installed." }
+
+      - name: Build serviced ISO
+        id: build
+        shell: pwsh
+        run: |
+          .\scripts\Build-ServicedISO.ps1 `
+            -WinRelease   "${{ inputs.win_release   || '25H2' }}" `
+            -Edition      "${{ inputs.edition       || 'Pro' }}" `
+            -ImageEdition "${{ inputs.image_edition || 'Windows 11 Pro' }}" `
+            -Build        "${{ inputs.build         || '26200' }}" `
+            -WorkDir      "D:\work" `
+            -CiSystem     "githubactions"
+
+      - name: Checksum + size
+        id: hash
+        shell: pwsh
+        run: |
+          $iso = "${{ steps.build.outputs.iso_path }}"
+          $sha = (Get-FileHash -Path $iso -Algorithm SHA256).Hash
+          $gb  = [math]::Round((Get-Item $iso).Length / 1GB, 2)
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "size_gb=$gb" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "SHA256: $sha"
+          Write-Host "Size:   $gb GB"
+
+      - name: Upload ISO to private Blob container
+        id: upload
+        shell: pwsh
+        env:
+          # Secrets are unreachable from fork PRs; see the header banner.
+          AZ_ACCOUNT:   ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZ_KEY:       ${{ secrets.AZURE_STORAGE_KEY }}
+          AZ_CONTAINER: ${{ secrets.AZURE_CONTAINER }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iso  = "${{ steps.build.outputs.iso_path }}"
+          $name = "${{ steps.build.outputs.iso_name }}"
+          $key  = "iso/$name"
+
+          # az CLI is preinstalled on the runner. It chunks large block
+          # blobs automatically, so a ~5 GB ISO is fine.
+          az storage blob upload `
+            --account-name   "$env:AZ_ACCOUNT" `
+            --account-key    "$env:AZ_KEY" `
+            --container-name "$env:AZ_CONTAINER" `
+            --name "$key" --file "$iso" --overwrite --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw "Blob upload failed." }
+
+          "object_key=$key" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Uploaded: $key"
+
+      - name: Prune old ISOs
+        shell: pwsh
+        env:
+          AZ_ACCOUNT:   ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZ_KEY:       ${{ secrets.AZURE_STORAGE_KEY }}
+          AZ_CONTAINER: ${{ secrets.AZURE_CONTAINER }}
+        run: |
+          $keep = [int]"${{ env.KEEP_LAST }}"
+
+          $blobs = az storage blob list `
+            --account-name   "$env:AZ_ACCOUNT" `
+            --account-key    "$env:AZ_KEY" `
+            --container-name "$env:AZ_CONTAINER" `
+            --prefix "iso/" --output json --only-show-errors | ConvertFrom-Json
+
+          if (-not $blobs) { Write-Host "Nothing to prune."; exit 0 }
+
+          $stale = $blobs |
+            Sort-Object { $_.properties.lastModified } -Descending |
+            Select-Object -Skip $keep
+
+          foreach ($b in $stale) {
+            Write-Host "Pruning $($b.name)"
+            az storage blob delete `
+              --account-name   "$env:AZ_ACCOUNT" `
+              --account-key    "$env:AZ_KEY" `
+              --container-name "$env:AZ_CONTAINER" `
+              --name "$($b.name)" --only-show-errors
+          }
+
+      - name: Write manifest
+        shell: pwsh
+        run: |
+          $manifest = [ordered]@{
+            iso_name   = "${{ steps.build.outputs.iso_name }}"
+            object_key = "${{ steps.upload.outputs.object_key }}"
+            container  = "(private)"
+            sha256     = "${{ steps.hash.outputs.sha256 }}"
+            size_gb    = "${{ steps.hash.outputs.size_gb }}"
+            cu_kb      = "${{ steps.build.outputs.cu_kb }}"
+            cu_title   = "${{ steps.build.outputs.cu_title }}"
+            built_utc  = (Get-Date).ToUniversalTime().ToString("o")
+            run_id     = "${{ github.run_id }}"
+          }
+          New-Item -Path "D:\work\out" -ItemType Directory -Force | Out-Null
+          $manifest | ConvertTo-Json | Set-Content "D:\work\out\manifest.json" -Encoding utf8
+          Get-Content "D:\work\out\manifest.json"
+
+      - name: Publish pointer Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "iso-${{ steps.build.outputs.cu_kb }}-${{ github.run_number }}"
+          name: "${{ steps.build.outputs.iso_name }}"
+          body: |
+            Serviced Windows 11 image.
+
+            **The ISO is not attached to this release.** Release assets cap at
+            2 GiB, and the image is deliberately kept out of public reach. It
+            lives in a private Azure Blob container — you need credentials.
+
+            | | |
+            |---|---|
+            | **CU applied** | ${{ steps.build.outputs.cu_title }} (`${{ steps.build.outputs.cu_kb }}`) |
+            | **Blob path** | `${{ steps.upload.outputs.object_key }}` |
+            | **Size** | ${{ steps.hash.outputs.size_gb }} GB |
+            | **SHA256** | `${{ steps.hash.outputs.sha256 }}` |
+
+            Fetch it (needs read access to the storage account):
+
+            ```powershell
+            az storage blob download `
+              --account-name <account> `
+              --container-name <container> `
+              --name "${{ steps.upload.outputs.object_key }}" `
+              --file ".\${{ steps.build.outputs.iso_name }}" `
+              --auth-mode login
+
+            # verify before deploying
+            (Get-FileHash ".\${{ steps.build.outputs.iso_name }}" -Algorithm SHA256).Hash
+            # expect: ${{ steps.hash.outputs.sha256 }}
+            ```
+          files: D:\work\out\manifest.json
+          draft: false
