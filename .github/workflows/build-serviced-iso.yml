@@ -60,6 +60,7 @@ jobs:
     # ISO + extract + WIM. windows-2022 still has D: with ~140 GB free.
     runs-on: windows-2022
     timeout-minutes: 360
+    environment: production
 
     steps:
       - uses: actions/checkout@v4
