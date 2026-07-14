@@ -60,6 +60,18 @@ jobs:
     # ISO + extract + WIM. windows-2022 still has D: with ~140 GB free.
     runs-on: windows-2022
     timeout-minutes: 360
+
+    # Secrets live in the `production` environment, restricted to the `main`
+    # branch (Settings > Environments). On a public repo this is free, and it
+    # closes the workflow_dispatch-from-a-feature-branch hole that plain repo
+    # secrets leave open.
+    #
+    # DO NOT add required reviewers / wait timer to this environment: a job
+    # cannot read environment secrets until reviewers approve, which would
+    # leave the weekly cron pending forever. Branch restriction only.
+    #
+    # Prefer plain repo secrets instead? Delete the line below; repo secrets
+    # resolve either way.
     environment: production
 
     steps:
@@ -94,7 +106,13 @@ jobs:
 
       - name: Build serviced ISO
         id: build
-        shell: pwsh
+        # Windows PowerShell 5.1, NOT pwsh 7. The Dism module
+        # (Mount-WindowsImage / Get-WindowsImage / Add-WindowsPackage) is a
+        # Windows PowerShell module; PS7 only reaches it through a
+        # compatibility shim, which is flaky for image servicing. Fido is also
+        # written for Windows PowerShell. This also matches the environment the
+        # script was developed and tested in.
+        shell: powershell
         run: |
           .\scripts\Build-ServicedISO.ps1 `
             -WinRelease   "${{ inputs.win_release   || '25H2' }}" `
