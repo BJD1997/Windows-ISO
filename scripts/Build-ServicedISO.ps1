@@ -52,6 +52,91 @@ foreach ($d in @($IsoDownloadDir, $ExtractDir, $MountDir, $CuDir, $OutputDir)) {
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
 # ------------------------------------------------------------------
+# Large-file downloader.
+#
+# Invoke-WebRequest is a poor fit for multi-GB files: it renders a progress
+# bar on every chunk (which dominates the transfer time), buffers badly, and
+# can't resume. This tries, in order:
+#
+#   1. BITS      - fastest, resumable, but it's a Windows SERVICE and can be
+#                  unavailable or refuse to start in CI. Don't bet the run on it.
+#   2. curl.exe  - ships in System32 on Server 2019+, so it's already on the
+#                  runner. Streams to disk, resumes, no service dependency.
+#   3. IWR       - last resort, with $ProgressPreference off (that single line
+#                  is the difference between minutes and hours).
+# ------------------------------------------------------------------
+function Get-LargeFile {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$OutFile,
+        [string]$Description = "file"
+    )
+
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+
+    # --- 1. BITS ---
+    try {
+        Import-Module BitsTransfer -ErrorAction Stop
+
+        $svc = Get-Service -Name BITS -ErrorAction Stop
+        if ($svc.Status -ne 'Running') {
+            Write-Host "Starting BITS service..."
+            Start-Service -Name BITS -ErrorAction Stop
+        }
+
+        Write-Host "Downloading $Description via BITS..."
+        # -Priority Foreground: the default background priority yields to other
+        # traffic and can crawl. We want the whole pipe.
+        Start-BitsTransfer -Source $Uri -Destination $OutFile `
+            -Priority Foreground -ErrorAction Stop
+
+        $sw.Stop()
+        $gb = (Get-Item $OutFile).Length / 1GB
+        Write-Host ("BITS: {0:N2} GB in {1:N1} min" -f $gb, $sw.Elapsed.TotalMinutes)
+        return
+    }
+    catch {
+        Write-Warning "BITS unavailable or failed: $($_.Exception.Message)"
+        Write-Warning "Falling back to curl.exe."
+        # A half-written file would poison a resume attempt.
+        if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- 2. curl.exe ---
+    $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+    if (Test-Path $curl) {
+        Write-Host "Downloading $Description via curl.exe..."
+        # -L follow redirects, --fail error on 4xx/5xx, -C - resume, retries on
+        # transient network blips (this is a long transfer; blips happen).
+        & $curl -L --fail --retry 3 --retry-delay 5 --retry-all-errors `
+            -C - -o $OutFile $Uri
+        if ($LASTEXITCODE -eq 0) {
+            $sw.Stop()
+            $gb = (Get-Item $OutFile).Length / 1GB
+            Write-Host ("curl: {0:N2} GB in {1:N1} min" -f $gb, $sw.Elapsed.TotalMinutes)
+            return
+        }
+        Write-Warning "curl.exe exited $LASTEXITCODE. Falling back to Invoke-WebRequest."
+        if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- 3. Invoke-WebRequest (last resort) ---
+    Write-Host "Downloading $Description via Invoke-WebRequest..."
+    $prevProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'   # <-- do not remove; see header
+    try {
+        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+    }
+    finally {
+        $ProgressPreference = $prevProgress
+    }
+
+    $sw.Stop()
+    $gb = (Get-Item $OutFile).Length / 1GB
+    Write-Host ("IWR: {0:N2} GB in {1:N1} min" -f $gb, $sw.Elapsed.TotalMinutes)
+}
+
+# ------------------------------------------------------------------
 # 1. Download the Windows ISO using Fido
 # ------------------------------------------------------------------
 function Get-WindowsIso {
@@ -64,9 +149,8 @@ function Get-WindowsIso {
     Write-Host "ISO URL: $url"
 
     $isoPath = Join-Path $IsoDownloadDir "windows.iso"
-    Write-Step "Downloading ISO (this is several GB)..."
-    # BITS-free, streamed download
-    Invoke-WebRequest -Uri $url -OutFile $isoPath -UseBasicParsing
+    Write-Step "Downloading ISO (several GB)..."
+    Get-LargeFile -Uri $url -OutFile $isoPath -Description "Windows ISO"
     Write-Host "Saved to $isoPath ($([math]::Round((Get-Item $isoPath).Length / 1GB, 2)) GB)"
     return $isoPath
 }
@@ -152,7 +236,7 @@ function Get-LatestCumulativeUpdate {
     $filePath = Join-Path $CuDir $fileName
 
     Write-Step "Downloading $kbNumber ..."
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $filePath -UseBasicParsing
+    Get-LargeFile -Uri $downloadUrl -OutFile $filePath -Description $kbNumber
     Write-Host "Saved to $filePath"
 
     return [pscustomobject]@{ Path = $filePath; KB = $kbNumber; Title = $updateTitle }
