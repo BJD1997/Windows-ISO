@@ -76,20 +76,60 @@ function Get-WindowsIso {
 # ------------------------------------------------------------------
 function Get-LatestCumulativeUpdate {
     $searchQuery = "Cumulative Update Windows 11 $Arch $WinRelease"
-    $catalogUrl  = "https://www.catalog.update.microsoft.com/Search.aspx?q=$searchQuery"
+    # Encode the query: raw spaces in a URL behave inconsistently across hosts.
+    $catalogUrl  = "https://www.catalog.update.microsoft.com/Search.aspx?q=$([uri]::EscapeDataString($searchQuery))"
 
     Write-Step "Searching Microsoft Update Catalog..."
-    $response = Invoke-WebRequest -Uri $catalogUrl -UseBasicParsing
 
-    $rows = $response.Content -split '<tr[^>]*id="' | Where-Object { $_ -match $Build } |
+    # Send a browser UA. The catalog can serve different markup to a bare
+    # PowerShell user-agent coming from a datacenter IP than to a desktop.
+    $headers = @{
+        "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "Accept"     = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    $response = Invoke-WebRequest -Uri $catalogUrl -UseBasicParsing -Headers $headers
+    $html = $response.Content
+
+    # A result row's id looks like: <tr id="<guid>_R0" ...>
+    # Splitting on '<tr ... id="' makes element 0 = all the page chrome BEFORE
+    # the first row (scripts, search box, headers). That chunk is NOT a result
+    # row. Previously it was only excluded by the build-number filter, so if the
+    # build number happened to appear anywhere in the chrome, it survived, landed
+    # at $rows[0], and the GUID regex blew up. Identify real rows FIRST.
+    $rowPattern = '^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_R\d+'
+    $allRows = $html -split '<tr[^>]*id="' | Where-Object { $_ -match $rowPattern }
+
+    if (-not $allRows) {
+        Write-Warning "No result rows parsed from the catalog page."
+        Write-Warning "Page length: $($html.Length) chars. First 500 chars follow:"
+        Write-Warning ($html.Substring(0, [Math]::Min(500, $html.Length)))
+        throw "Catalog returned no parseable result rows (search: '$searchQuery')."
+    }
+
+    Write-Host "Parsed $($allRows.Count) result row(s) from the catalog."
+
+    # Now narrow to the update we actually want.
+    $candidates = $allRows |
+        Where-Object { $_ -match $Build } |
         Where-Object { $_ -notmatch 'Preview' -and $_ -notmatch '\.NET' -and $_ -notmatch 'Dynamic' }
-    if (-not $rows) { throw "No matching cumulative update found for build $Build." }
 
-    $firstRow = $rows[0]
+    if (-not $candidates) {
+        # Dump what we DID see -- makes a wrong -Build value obvious immediately.
+        Write-Warning "No row matched build '$Build'. Titles returned by the catalog:"
+        foreach ($r in $allRows) {
+            if ($r -match '<a[^>]*>([^<]+)</a>') { Write-Warning "  - $($Matches[1].Trim())" }
+        }
+        throw "No cumulative update found for build $Build. Is -Build correct for $WinRelease?"
+    }
 
-    if ($firstRow -match '^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_R0') {
-        $updateId = $Matches[1]
-    } else { throw "Could not extract update ID." }
+    $firstRow = $candidates[0]
+
+    # Anchored, so it can only ever match this row's own id -- not a GUID
+    # belonging to some other row further down the chunk.
+    if ($firstRow -notmatch $rowPattern) {
+        throw "Could not extract update ID (row did not start with a GUID)."
+    }
+    $updateId = $Matches[1]
 
     if ($firstRow -match '<a[^>]*>([^<]+)</a>') { $updateTitle = $Matches[1].Trim() }
 
@@ -102,7 +142,7 @@ function Get-LatestCumulativeUpdate {
         updateIDs = "[{""size"":0,""uidInfo"":""$updateId"",""updateID"":""$updateId""}]"
     }
     $downloadPage = Invoke-WebRequest -Uri "https://www.catalog.update.microsoft.com/DownloadDialog.aspx" `
-        -Method Post -Body $postBody -UseBasicParsing
+        -Method Post -Body $postBody -UseBasicParsing -Headers $headers
 
     $allUrls     = [regex]::Matches($downloadPage.Content, "https?://[^'""\s]+\.msu")
     $downloadUrl = ($allUrls | Where-Object { $_.Value -match $kbNumber }).Value | Select-Object -First 1
