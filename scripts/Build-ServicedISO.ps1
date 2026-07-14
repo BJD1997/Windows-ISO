@@ -54,73 +54,114 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 # ------------------------------------------------------------------
 # Large-file downloader.
 #
-# Invoke-WebRequest is a poor fit for multi-GB files: it renders a progress
-# bar on every chunk (which dominates the transfer time), buffers badly, and
-# can't resume. This tries, in order:
+# Ordered for a CI runner (fat pipe, no competing traffic, no user session):
 #
-#   1. BITS      - fastest, resumable, but it's a Windows SERVICE and can be
-#                  unavailable or refuse to start in CI. Don't bet the run on it.
-#   2. curl.exe  - ships in System32 on Server 2019+, so it's already on the
-#                  runner. Streams to disk, resumes, no service dependency.
-#   3. IWR       - last resort, with $ProgressPreference off (that single line
-#                  is the difference between minutes and hours).
+#   1. aria2c  - parallel range requests (-x16). Neither BITS nor curl splits a
+#                SINGLE file across connections; aria2c does, and MS's CDN
+#                supports ranges. This is the big win: often 5-10x.
+#   2. curl.exe- in System32 on Server 2019+. Single-stream but solid, resumes,
+#                no service dependency.
+#   3. BITS    - deliberately POLITE (throttles, yields to other traffic), which
+#                is worthless on a dedicated runner. Worse, it's a service that
+#                expects a user session and can PARK A JOB indefinitely in a
+#                non-interactive context. Wrapped in a hard timeout below so a
+#                stuck job can't eat the whole 360-min budget.
+#   4. IWR     - last resort. $ProgressPreference off; rendering the progress
+#                bar dominates the transfer on multi-GB files (minutes vs hours).
 # ------------------------------------------------------------------
 function Get-LargeFile {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$OutFile,
-        [string]$Description = "file"
+        [string]$Description = "file",
+        [int]$BitsTimeoutMinutes = 20
     )
 
     $sw = [Diagnostics.Stopwatch]::StartNew()
 
-    # --- 1. BITS ---
-    try {
-        Import-Module BitsTransfer -ErrorAction Stop
-
-        $svc = Get-Service -Name BITS -ErrorAction Stop
-        if ($svc.Status -ne 'Running') {
-            Write-Host "Starting BITS service..."
-            Start-Service -Name BITS -ErrorAction Stop
-        }
-
-        Write-Host "Downloading $Description via BITS..."
-        # -Priority Foreground: the default background priority yields to other
-        # traffic and can crawl. We want the whole pipe.
-        Start-BitsTransfer -Source $Uri -Destination $OutFile `
-            -Priority Foreground -ErrorAction Stop
-
+    function Report($tool) {
         $sw.Stop()
         $gb = (Get-Item $OutFile).Length / 1GB
-        Write-Host ("BITS: {0:N2} GB in {1:N1} min" -f $gb, $sw.Elapsed.TotalMinutes)
-        return
+        $mbps = if ($sw.Elapsed.TotalSeconds -gt 0) {
+            ($gb * 1024) / $sw.Elapsed.TotalSeconds
+        } else { 0 }
+        Write-Host ("{0}: {1:N2} GB in {2:N1} min ({3:N1} MB/s)" -f `
+            $tool, $gb, $sw.Elapsed.TotalMinutes, $mbps) -ForegroundColor Green
     }
-    catch {
-        Write-Warning "BITS unavailable or failed: $($_.Exception.Message)"
-        Write-Warning "Falling back to curl.exe."
-        # A half-written file would poison a resume attempt.
+
+    function Clear-Partial {
         if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+        # aria2c leaves a .aria2 control file behind on failure
+        if (Test-Path "$OutFile.aria2") { Remove-Item "$OutFile.aria2" -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- 1. aria2c (parallel) ---
+    $aria = Get-Command aria2c.exe -ErrorAction SilentlyContinue
+    if ($aria) {
+        Write-Host "Downloading $Description via aria2c (16 connections)..."
+        $dir  = Split-Path $OutFile -Parent
+        $file = Split-Path $OutFile -Leaf
+        & $aria.Source `
+            -x16 -s16 -k 10M `
+            --max-tries=5 --retry-wait=5 `
+            --console-log-level=warn --summary-interval=30 `
+            --allow-overwrite=true --auto-file-renaming=false `
+            -d $dir -o $file $Uri
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile)) { Report "aria2c"; return }
+        Write-Warning "aria2c exited $LASTEXITCODE. Falling back to curl.exe."
+        Clear-Partial
     }
 
     # --- 2. curl.exe ---
     $curl = Join-Path $env:SystemRoot "System32\curl.exe"
     if (Test-Path $curl) {
         Write-Host "Downloading $Description via curl.exe..."
-        # -L follow redirects, --fail error on 4xx/5xx, -C - resume, retries on
-        # transient network blips (this is a long transfer; blips happen).
         & $curl -L --fail --retry 3 --retry-delay 5 --retry-all-errors `
             -C - -o $OutFile $Uri
-        if ($LASTEXITCODE -eq 0) {
-            $sw.Stop()
-            $gb = (Get-Item $OutFile).Length / 1GB
-            Write-Host ("curl: {0:N2} GB in {1:N1} min" -f $gb, $sw.Elapsed.TotalMinutes)
-            return
-        }
-        Write-Warning "curl.exe exited $LASTEXITCODE. Falling back to Invoke-WebRequest."
-        if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+        if ($LASTEXITCODE -eq 0) { Report "curl"; return }
+        Write-Warning "curl.exe exited $LASTEXITCODE. Falling back to BITS."
+        Clear-Partial
     }
 
-    # --- 3. Invoke-WebRequest (last resort) ---
+    # --- 3. BITS (with a hang guard) ---
+    try {
+        Import-Module BitsTransfer -ErrorAction Stop
+        $svc = Get-Service -Name BITS -ErrorAction Stop
+        if ($svc.Status -ne 'Running') { Start-Service -Name BITS -ErrorAction Stop }
+
+        Write-Host "Downloading $Description via BITS (timeout ${BitsTimeoutMinutes}m)..."
+
+        # -Asynchronous so we can poll. A synchronous Start-BitsTransfer that
+        # parks in a non-interactive session would block forever.
+        $job = Start-BitsTransfer -Source $Uri -Destination $OutFile `
+            -Priority Foreground -Asynchronous -ErrorAction Stop
+
+        $deadline = (Get-Date).AddMinutes($BitsTimeoutMinutes)
+        while ($job.JobState -in @('Connecting','Transferring','Queued','TransientError')) {
+            if ((Get-Date) -gt $deadline) {
+                Remove-BitsTransfer -BitsJob $job -ErrorAction SilentlyContinue
+                throw "BITS exceeded ${BitsTimeoutMinutes} min (state: $($job.JobState)) - likely stalled."
+            }
+            Start-Sleep -Seconds 5
+            $job = Get-BitsTransfer -JobId $job.JobId -ErrorAction Stop
+        }
+
+        if ($job.JobState -ne 'Transferred') {
+            Remove-BitsTransfer -BitsJob $job -ErrorAction SilentlyContinue
+            throw "BITS ended in state '$($job.JobState)'."
+        }
+
+        Complete-BitsTransfer -BitsJob $job
+        Report "BITS"
+        return
+    }
+    catch {
+        Write-Warning "BITS failed: $($_.Exception.Message)"
+        Write-Warning "Falling back to Invoke-WebRequest."
+        Clear-Partial
+    }
+
+    # --- 4. Invoke-WebRequest (last resort) ---
     Write-Host "Downloading $Description via Invoke-WebRequest..."
     $prevProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'   # <-- do not remove; see header
@@ -130,10 +171,7 @@ function Get-LargeFile {
     finally {
         $ProgressPreference = $prevProgress
     }
-
-    $sw.Stop()
-    $gb = (Get-Item $OutFile).Length / 1GB
-    Write-Host ("IWR: {0:N2} GB in {1:N1} min" -f $gb, $sw.Elapsed.TotalMinutes)
+    Report "IWR"
 }
 
 # ------------------------------------------------------------------
