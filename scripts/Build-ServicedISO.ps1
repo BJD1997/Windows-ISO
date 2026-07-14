@@ -104,6 +104,7 @@ function Get-LargeFile {
         & $aria.Source `
             -x16 -s16 -k 10M `
             --max-tries=5 --retry-wait=5 `
+            --file-allocation=falloc `
             --console-log-level=warn --summary-interval=30 `
             --allow-overwrite=true --auto-file-renaming=false `
             -d $dir -o $file $Uri
@@ -323,23 +324,59 @@ function Get-LatestCumulativeUpdate {
 function Expand-Iso {
     param([string]$IsoPath)
 
-    Write-Step "Mounting ISO..."
-    $mount  = Mount-DiskImage -ImagePath $IsoPath -PassThru
-    $volume = ($mount | Get-Volume).DriveLetter
-    $driveRoot = "${volume}:\"
+    # Prefer 7-Zip over Mount-DiskImage.
+    #
+    # Mount-DiskImage is fragile on a CI runner: it depends on the Virtual Disk
+    # service, needs a free drive letter to hand out, and refuses SPARSE files.
+    # A 16-connection aria2c download writes out of order, which on NTFS can
+    # produce exactly that -- and the mount then fails with
+    #   HRESULT 0x80070003  "The system cannot find the path specified"
+    # on a file you can plainly see on disk. Deeply unhelpful error.
+    #
+    # 7z reads the ISO as an archive: no service, no drive letter, sparse is
+    # irrelevant. It's also ONE pass, vs mount -> copy every file -> dismount.
+    $7zPath = $null
+    $cmd = Get-Command 7z.exe -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $7zPath = $cmd.Source
+    } elseif (Test-Path "C:\Program Files\7-Zip\7z.exe") {
+        $7zPath = "C:\Program Files\7-Zip\7z.exe"
+    }
 
-    Write-Step "Copying ISO contents to $ExtractDir ..."
-    Copy-Item -Path (Join-Path $driveRoot '*') -Destination $ExtractDir -Recurse -Force
+    if ($7zPath) {
+        Write-Step "Extracting ISO with 7-Zip -> $ExtractDir ..."
+        # -y assume yes, -bso0/-bsp0 silence per-file and progress spam
+        & $7zPath x $IsoPath "-o$ExtractDir" -y -bso0 -bsp0
+        if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed (exit $LASTEXITCODE)." }
+    }
+    else {
+        Write-Warning "7-Zip not found; falling back to Mount-DiskImage."
+        Write-Step "Mounting ISO..."
+        $mount     = Mount-DiskImage -ImagePath $IsoPath -PassThru
+        $volume    = ($mount | Get-Volume).DriveLetter
+        $driveRoot = "${volume}:\"
 
-    Dismount-DiskImage -ImagePath $IsoPath | Out-Null
+        Write-Step "Copying ISO contents to $ExtractDir ..."
+        Copy-Item -Path (Join-Path $driveRoot '*') -Destination $ExtractDir -Recurse -Force
 
-    # Clear read-only attributes copied from the mounted ISO
+        Dismount-DiskImage -ImagePath $IsoPath | Out-Null
+    }
+
+    # Files off an ISO come out read-only. DISM and oscdimg need to write here.
     Get-ChildItem -Path $ExtractDir -Recurse -File |
         ForEach-Object { $_.Attributes = 'Normal' }
 
-    # Free the raw ISO immediately to save disk
+    # Fail here, not 40 minutes deep in DISM, if the extract went sideways.
+    $sourcesDir = Join-Path $ExtractDir "sources"
+    if (-not (Test-Path $sourcesDir)) {
+        throw "Extraction produced no 'sources' folder -- ISO layout unexpected or extract failed."
+    }
+
+    # Free ~8 GB immediately -- the disk budget is tight.
     Remove-Item $IsoPath -Force
-    Write-Host "Extraction complete; raw ISO removed."
+
+    $count = (Get-ChildItem -Path $ExtractDir -Recurse -File).Count
+    Write-Host "Extraction complete: $count files. Raw ISO removed."
 }
 
 # ------------------------------------------------------------------
