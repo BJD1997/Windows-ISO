@@ -20,7 +20,7 @@ param(
     [string]$WinRelease   = "25H2",              # Fido -Rel value
     [string]$Edition      = "Pro",               # Fido -Ed value
     [string]$ImageEdition = "Windows 11 Pro",    # WIM ImageName to service
-    [string]$Language     = "English",
+    [string]$Language     = "Dutch",
     [string]$Arch         = "x64",
     [string]$Build        = "26200",             # OS build family for CU search (25H2 = 26200)
     [string]$WorkDir      = "D:\work",
