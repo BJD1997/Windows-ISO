@@ -45,6 +45,11 @@ on:
       build:
         description: "OS build family for CU search (25H2=26200, 24H2=26100)"
         default: "26200"
+      languages:
+        description: "Which language ISO(s) to build"
+        type: choice
+        default: "both"
+        options: [ "both", "English", "Dutch" ]
 
 # Least privilege: only enough to cut the pointer Release.
 permissions:
@@ -54,12 +59,44 @@ env:
   KEEP_LAST: "3"        # ISOs to retain in the container
 
 jobs:
+  # Decide which languages to build. The scheduled run has no inputs, so it
+  # must default to both. A manual run honors the `languages` choice. The
+  # matrix can't read `inputs` directly for conditional membership, so we
+  # compute a JSON array here and feed it in.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      langs: ${{ steps.pick.outputs.langs }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          choice="${{ github.event.inputs.languages }}"
+          # Empty on schedule -> both. Otherwise honor the choice.
+          case "$choice" in
+            English) langs='["English"]' ;;
+            Dutch)   langs='["Dutch"]' ;;
+            *)       langs='["English","Dutch"]' ;;   # both, and the schedule default
+          esac
+          echo "langs=$langs" >> "$GITHUB_OUTPUT"
+          echo "Building: $langs"
+
   build-iso:
+    needs: setup
     # MUST be windows-2022. windows-latest (Server 2025) dropped the D:
     # drive and leaves only ~33 GB on C: -- not enough for
     # ISO + extract + WIM. windows-2022 still has D: with ~140 GB free.
     runs-on: windows-2022
     timeout-minutes: 360
+
+    strategy:
+      # One fresh runner per language, each with its own full D: drive. On a
+      # public repo these run in PARALLEL for free, so two languages finish in
+      # about the wall-clock time of one. Never loop languages inside a single
+      # job -- the D: budget (~45 GB used per build) can't hold two at once.
+      fail-fast: false        # a Dutch failure must not cancel a good English build
+      matrix:
+        language: ${{ fromJSON(needs.setup.outputs.langs) }}
 
     # Secrets live in the `production` environment, restricted to the `main`
     # branch (Settings > Environments). On a public repo this is free, and it
@@ -104,6 +141,15 @@ jobs:
           $oscdimg = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe"
           if (-not (Test-Path $oscdimg)) { throw "oscdimg not installed." }
 
+      - name: Install aria2 (parallel downloader)
+        shell: pwsh
+        run: |
+          # aria2c pulls a single file over 16 parallel range requests. Neither
+          # BITS nor curl splits one file across connections, and this is the
+          # dominant cost in the job after DISM. ~20s to install, saves minutes.
+          choco install aria2 --no-progress -y
+          aria2c --version | Select-Object -First 1
+
       - name: Build serviced ISO
         id: build
         # Windows PowerShell 5.1, NOT pwsh 7. The Dism module
@@ -119,6 +165,7 @@ jobs:
             -Edition      "${{ inputs.edition       || 'Pro' }}" `
             -ImageEdition "${{ inputs.image_edition || 'Windows 11 Pro' }}" `
             -Build        "${{ inputs.build         || '26200' }}" `
+            -Language     "${{ matrix.language }}" `
             -WorkDir      "D:\work" `
             -CiSystem     "githubactions"
 
@@ -146,7 +193,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $iso  = "${{ steps.build.outputs.iso_path }}"
           $name = "${{ steps.build.outputs.iso_name }}"
-          $key  = "iso/$name"
+          # Per-language prefix so the prune step can retain N-per-language
+          # instead of N-overall (see the Prune step for why that matters).
+          $key  = "iso/${{ matrix.language }}/$name"
 
           # az CLI is preinstalled on the runner. It chunks large block
           # blobs automatically, so a ~5 GB ISO is fine.
@@ -168,12 +217,18 @@ jobs:
           AZ_CONTAINER: ${{ secrets.AZURE_CONTAINER }}
         run: |
           $keep = [int]"${{ env.KEEP_LAST }}"
+          # Prune ONLY this language's prefix. A shared prune sorted all
+          # languages together, so with KEEP_LAST=3, three English builds would
+          # evict every Dutch ISO. Scoping to iso/<language>/ keeps N per
+          # language, and the parallel Dutch job pruning its own prefix at the
+          # same time can't touch these blobs.
+          $prefix = "iso/${{ matrix.language }}/"
 
           $blobs = az storage blob list `
             --account-name   "$env:AZ_ACCOUNT" `
             --account-key    "$env:AZ_KEY" `
             --container-name "$env:AZ_CONTAINER" `
-            --prefix "iso/" --output json --only-show-errors | ConvertFrom-Json
+            --prefix "$prefix" --output json --only-show-errors | ConvertFrom-Json
 
           if (-not $blobs) { Write-Host "Nothing to prune."; exit 0 }
 
@@ -211,7 +266,10 @@ jobs:
       - name: Publish pointer Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "iso-${{ steps.build.outputs.cu_kb }}-${{ github.run_number }}"
+          # Language in the tag: without it, both matrix jobs would cut the
+          # SAME tag and race -- whichever finishes last wins, and the other
+          # language's manifest is lost.
+          tag_name: "iso-${{ matrix.language }}-${{ steps.build.outputs.cu_kb }}-${{ github.run_number }}"
           name: "${{ steps.build.outputs.iso_name }}"
           body: |
             Serviced Windows 11 image.
