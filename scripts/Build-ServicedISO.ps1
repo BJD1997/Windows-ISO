@@ -20,7 +20,7 @@ param(
     [string]$WinRelease   = "25H2",              # Fido -Rel value
     [string]$Edition      = "Pro",               # Fido -Ed value
     [string]$ImageEdition = "Windows 11 Pro",    # WIM ImageName to service
-    [string]$Language     = "Dutch",
+    [string]$Language     = "English",
     [string]$Arch         = "x64",
     [string]$Build        = "26200",             # OS build family for CU search (25H2 = 26200)
     [string]$WorkDir      = "D:\work",
@@ -503,7 +503,11 @@ function New-BootableIso {
 # MAIN
 # ==================================================================
 $stamp   = Get-Date -Format "yyyy-MM-dd"
-$isoName = "Windows11_${WinRelease}_${Edition}_${Arch}_${stamp}.iso"
+# Language MUST be in the filename. Without it, an English and a Dutch build
+# produce the same name -> the same blob key -> the second silently overwrites
+# the first. (Fido uses "English"/"Dutch"; keep it short and path-safe here.)
+$langTag = ($Language -replace '[^A-Za-z0-9]', '')
+$isoName = "Windows11_${WinRelease}_${Edition}_${langTag}_${Arch}_${stamp}.iso"
 $outIso  = Join-Path $OutputDir $isoName
 
 $cu = Get-LatestCumulativeUpdate          # fail fast before the big ISO download
