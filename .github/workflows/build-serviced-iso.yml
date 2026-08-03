@@ -28,7 +28,7 @@ on:
   schedule:
     # Weekly, Wednesday 06:00 UTC. Affordable now: public repos get
     # unlimited free minutes on standard hosted runners.
-    - cron: "0 6 * * 3"
+    - cron: "0 6 28 * *"
   workflow_dispatch:
     inputs:
       win_release:
