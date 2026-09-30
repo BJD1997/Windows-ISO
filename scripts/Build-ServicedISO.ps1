@@ -193,6 +193,69 @@ function Get-LargeFile {
 }
 
 # ------------------------------------------------------------------
+# 0. Make sure Fido knows -WinRelease; teach it if Microsoft is ahead
+#
+# Fido does the hard part (Microsoft's session whitelisting / ov-df anti-bot
+# handshake), but it maps releases to "product edition IDs" through a table
+# that is hand-edited upstream. On release day Microsoft's download page
+# already serves the new release while Fido still says
+#   "Invalid Windows release provided."
+# So: if Fido doesn't list the release, read the current IDs straight off
+# Microsoft's download pages and inject them into a patched COPY of Fido.
+# Once upstream catches up, the patch simply stops being applied.
+# ------------------------------------------------------------------
+function Resolve-FidoRelease {
+    Write-Step "Checking that Fido supports Windows 11 $WinRelease..."
+
+    $list = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $FidoPath -Win 11 -Rel List 2>&1 |
+        ForEach-Object { $_.ToString().Trim() }
+    if ($list | Where-Object { $_ -like "- $WinRelease*" }) {
+        Write-Host "Fido lists $WinRelease; using it as-is."
+        return
+    }
+
+    Write-Warning "Fido does not list $WinRelease yet. Releases it knows:"
+    $list | Where-Object { $_ -like '- *' } | ForEach-Object { Write-Warning "  $_" }
+    Write-Step "Reading product edition IDs from Microsoft's download pages..."
+
+    $headers = @{ "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" }
+    $ids = @{}
+    foreach ($page in @(@{ Arch = 'x64'; Slug = 'windows11' }, @{ Arch = 'ARM64'; Slug = 'windows11arm64' })) {
+        $url  = "https://www.microsoft.com/en-us/software-download/$($page.Slug)"
+        $html = (Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers).Content
+
+        # Only trust the ID if the page really is serving the release we want --
+        # otherwise we'd silently build the previous release under a new name.
+        if ($html -notmatch "Version\s+$([regex]::Escape($WinRelease))\b") {
+            throw "Microsoft's $($page.Arch) download page does not offer Windows 11 $WinRelease yet, and neither does Fido."
+        }
+        if ($html -notmatch '<option[^>]*value="(\d+)"[^>]*>[^<]*multi-edition ISO') {
+            throw "Could not find the product edition ID on $url (page layout changed?)."
+        }
+        $ids[$page.Arch] = [int]$Matches[1]
+        Write-Host "  $($page.Arch): product edition ID $($ids[$page.Arch])"
+    }
+
+    # Fido's table: @("Windows 11", "windows11"), followed by one @(...) per
+    # release, newest first. -Rel matches by prefix, so "26H2 (...)" works.
+    $src    = Get-Content -LiteralPath $FidoPath -Raw
+    $anchor = '@("Windows 11", "windows11"),'
+    $at     = $src.IndexOf($anchor)
+    if ($at -lt 0) { throw "Fido's release table layout changed; cannot patch in $WinRelease." }
+    $insertAt = $src.IndexOf("`n", $at) + 1
+    $entry = "`t`t@(`r`n" +
+             "`t`t`t`"$WinRelease (patched from microsoft.com: $($ids['x64'])/$($ids['ARM64']))`",`r`n" +
+             "`t`t`t@(`"Windows 11 Home/Pro/Edu`", @($($ids['x64']), $($ids['ARM64'])))`r`n" +
+             "`t`t),`r`n"
+
+    $patched = Join-Path $WorkDir "Fido-patched.ps1"
+    # UTF-8 with BOM: Windows PowerShell 5.1 misreads BOM-less UTF-8.
+    [IO.File]::WriteAllText($patched, $src.Insert($insertAt, $entry), [Text.UTF8Encoding]::new($true))
+    $script:FidoPath = $patched
+    Write-Host "Using patched Fido: $patched"
+}
+
+# ------------------------------------------------------------------
 # 1. Download the Windows ISO using Fido
 # ------------------------------------------------------------------
 function Get-WindowsIso {
@@ -240,6 +303,11 @@ function Get-WindowsIso {
     }
 
     Write-Host "ISO URL: $url"
+
+    # Microsoft names ISOs like Windows11_Client_x64_nl-nl_26300_9457.iso, i.e.
+    # the build revision it already contains. Kept in a script variable rather
+    # than returned: this function's output IS the ISO path (see Expand-Iso).
+    $script:IsoRevision = if ($url -match '_\d{5}_(\d+)\.iso') { [int]$Matches[1] } else { $null }
 
     $isoPath = Join-Path $IsoDownloadDir "windows.iso"
     Write-Step "Downloading ISO (several GB)..."
@@ -316,6 +384,7 @@ function Get-LatestCumulativeUpdate {
         throw "Could not extract update ID (row did not start with a GUID)."
     }
     $updateId = $Matches[1]
+    $revision = if ($firstRow -match $buildPattern) { [int]$Matches[1] } else { $null }
 
     if ($firstRow -match '<a[^>]*>([^<]+)</a>') { $updateTitle = $Matches[1].Trim() }
 
@@ -341,7 +410,7 @@ function Get-LatestCumulativeUpdate {
     Get-LargeFile -Uri $downloadUrl -OutFile $filePath -Description $kbNumber
     Write-Host "Saved to $filePath"
 
-    return [pscustomobject]@{ Path = $filePath; KB = $kbNumber; Title = $updateTitle }
+    return [pscustomobject]@{ Path = $filePath; KB = $kbNumber; Title = $updateTitle; Revision = $revision }
 }
 
 # ------------------------------------------------------------------
@@ -520,11 +589,19 @@ $langTag = ($Language -replace '[^A-Za-z0-9]', '')
 $isoName = "Windows11_${WinRelease}_${Edition}_${langTag}_${Arch}_${stamp}.iso"
 $outIso  = Join-Path $OutputDir $isoName
 
+$script:IsoRevision = $null
+Resolve-FidoRelease                       # seconds; fail before any big download
 $cu = Get-LatestCumulativeUpdate          # fail fast before the big ISO download
 $isoPath = Get-WindowsIso
 Expand-Iso -IsoPath $isoPath
 $wim = Resolve-InstallWim
-Add-CuToWim -WimPath $wim -CuPath $cu.Path
+if ($script:IsoRevision -and $cu.Revision -and $script:IsoRevision -ge $cu.Revision) {
+    # Right after a release (or a media refresh) Microsoft's ISO can already
+    # contain the latest CU. Re-applying it is an hour of DISM for nothing.
+    Write-Step "ISO is already $Build.$($script:IsoRevision) (>= $($cu.KB) = $Build.$($cu.Revision)); skipping CU servicing."
+} else {
+    Add-CuToWim -WimPath $wim -CuPath $cu.Path
+}
 New-BootableIso -OutIsoPath $outIso
 
 # ------------------------------------------------------------------
