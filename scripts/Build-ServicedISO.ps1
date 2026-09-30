@@ -17,12 +17,12 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$WinRelease   = "25H2",              # Fido -Rel value
+    [string]$WinRelease   = "26H2",              # Fido -Rel value
     [string]$Edition      = "Pro",               # Fido -Ed value
     [string]$ImageEdition = "Windows 11 Pro",    # WIM ImageName to service
     [string]$Language     = "English",
     [string]$Arch         = "x64",
-    [string]$Build        = "26200",             # OS build family for CU search (25H2 = 26200)
+    [string]$Build        = "26300",             # OS build family for CU search (26H2 = 26300)
     [string]$WorkDir      = "D:\work",
     [string]$FidoPath     = "D:\work\Fido.ps1",
     [string]$OscdimgPath  = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
