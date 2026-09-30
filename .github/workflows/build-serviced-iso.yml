@@ -34,8 +34,8 @@ on:
       win_release:
         description: "Windows 11 release"
         type: choice
-        default: "25H2"
-        options: [ "25H2", "24H2" ]
+        default: "26H2"
+        options: [ "26H2", "25H2", "24H2" ]
       edition:
         description: "Edition (Fido)"
         default: "Pro"
@@ -43,8 +43,8 @@ on:
         description: "WIM ImageName to service"
         default: "Windows 11 Pro"
       build:
-        description: "OS build family for CU search (25H2=26200, 24H2=26100)"
-        default: "26200"
+        description: "OS build family for CU search (26H2=26300, 25H2=26200, 24H2=26100)"
+        default: "26300"
       languages:
         description: "Which language ISO(s) to build"
         type: choice
@@ -161,10 +161,10 @@ jobs:
         shell: powershell
         run: |
           .\scripts\Build-ServicedISO.ps1 `
-            -WinRelease   "${{ inputs.win_release   || '25H2' }}" `
+            -WinRelease   "${{ inputs.win_release   || '26H2' }}" `
             -Edition      "${{ inputs.edition       || 'Pro' }}" `
             -ImageEdition "${{ inputs.image_edition || 'Windows 11 Pro' }}" `
-            -Build        "${{ inputs.build         || '26200' }}" `
+            -Build        "${{ inputs.build         || '26300' }}" `
             -Language     "${{ matrix.language }}" `
             -WorkDir      "D:\work" `
             -CiSystem     "githubactions"
