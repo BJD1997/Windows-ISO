@@ -25,7 +25,8 @@ param(
     [string]$Build        = "26300",             # OS build family for CU search (26H2 = 26300)
     [string]$WorkDir      = "D:\work",
     [string]$FidoPath     = "D:\work\Fido.ps1",
-    [string]$OscdimgPath  = "C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
+    [switch]$IncludePreview,                     # also consider optional "Cumulative Update Preview" (D-week) releases
+    [string]$OscdimgPath  ="C:\Program Files (x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
 
     # Which CI system to emit output variables for.
     #   githubactions -> writes key=value lines to $env:GITHUB_OUTPUT
@@ -285,11 +286,20 @@ function Get-LatestCumulativeUpdate {
     Write-Host "Parsed $($allRows.Count) result row(s) from the catalog."
 
     # Now narrow to the update we actually want.
-    $candidates = $allRows |
-        Where-Object { $_ -match $Build } |
-        Where-Object { $_ -notmatch 'Preview' -and $_ -notmatch '\.NET' -and $_ -notmatch 'Dynamic' }
+    # @() is essential: if exactly ONE row survives (e.g. a brand-new release
+    # with a single CU), the pipeline yields a bare string, and $candidates[0]
+    # would then be its first CHARACTER rather than the row.
+    # Match the build as "<build>.<revision>" so it can't hit a GUID fragment.
+    $buildPattern = "\b$([regex]::Escape($Build))\.(\d+)"
+    $candidates = @($allRows |
+        Where-Object { $_ -match $buildPattern } |
+        Where-Object { $IncludePreview -or $_ -notmatch 'Preview' } |
+        Where-Object { $_ -notmatch '\.NET' -and $_ -notmatch 'Dynamic' } |
+        # Newest revision first. The catalog doesn't guarantee order, and with
+        # previews allowed the preview is usually newer than the latest B-release.
+        Sort-Object -Descending { if ($_ -match $buildPattern) { [int]$Matches[1] } else { 0 } })
 
-    if (-not $candidates) {
+    if ($candidates.Count -eq 0) {
         # Dump what we DID see -- makes a wrong -Build value obvious immediately.
         Write-Warning "No row matched build '$Build'. Titles returned by the catalog:"
         foreach ($r in $allRows) {

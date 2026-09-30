@@ -45,6 +45,10 @@ on:
       build:
         description: "OS build family for CU search (26H2=26300, 25H2=26200, 24H2=26100)"
         default: "26300"
+      include_preview:
+        description: "Include preview (optional, non-security) cumulative updates"
+        type: boolean
+        default: false
       languages:
         description: "Which language ISO(s) to build"
         type: choice
@@ -166,6 +170,7 @@ jobs:
             -ImageEdition "${{ inputs.image_edition || 'Windows 11 Pro' }}" `
             -Build        "${{ inputs.build         || '26300' }}" `
             -Language     "${{ matrix.language }}" `
+            -IncludePreview:$${{ inputs.include_preview == true }} `
             -WorkDir      "D:\work" `
             -CiSystem     "githubactions"
 
