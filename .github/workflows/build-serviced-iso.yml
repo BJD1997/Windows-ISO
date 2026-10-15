@@ -26,9 +26,9 @@ name: Build Serviced Windows 11 ISO
 
 on:
   schedule:
-    # Weekly, Wednesday 06:00 UTC. Affordable now: public repos get
+    # Monthly on the 16th at 06:00 UTC. Affordable now: public repos get
     # unlimited free minutes on standard hosted runners.
-    - cron: "0 6 28 * *"
+    - cron: "0 6 16 * *"
   workflow_dispatch:
     inputs:
       win_release:
